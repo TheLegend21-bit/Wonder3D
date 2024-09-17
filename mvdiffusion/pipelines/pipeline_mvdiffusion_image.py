@@ -30,7 +30,7 @@ from diffusers.utils import deprecate, logging, randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-
+from einops import rearrange, repeat
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -77,7 +77,7 @@ class MVDiffusionImagePipeline(DiffusionPipeline):
         feature_extractor: CLIPImageProcessor,
         requires_safety_checker: bool = True,
         camera_embedding_type: str = 'e_de_da_sincos',
-        num_views: int = 4
+        num_views: int = 6
     ):
         super().__init__()
 
@@ -133,6 +133,20 @@ class MVDiffusionImagePipeline(DiffusionPipeline):
         self.camera_embedding_type: str = camera_embedding_type
         self.num_views: int = num_views
 
+        self.camera_embedding =  torch.tensor(
+            [[ 0.0000,  0.0000,  0.0000,  1.0000,  0.0000],
+            [ 0.0000, -0.2362,  0.8125,  1.0000,  0.0000],
+            [ 0.0000, -0.1686,  1.6934,  1.0000,  0.0000],
+            [ 0.0000,  0.5220,  3.1406,  1.0000,  0.0000],
+            [ 0.0000,  0.6904,  4.8359,  1.0000,  0.0000],
+            [ 0.0000,  0.3733,  5.5859,  1.0000,  0.0000],
+            [ 0.0000,  0.0000,  0.0000,  0.0000,  1.0000],
+            [ 0.0000, -0.2362,  0.8125,  0.0000,  1.0000],
+            [ 0.0000, -0.1686,  1.6934,  0.0000,  1.0000],
+            [ 0.0000,  0.5220,  3.1406,  0.0000,  1.0000],
+            [ 0.0000,  0.6904,  4.8359,  0.0000,  1.0000],
+            [ 0.0000,  0.3733,  5.5859,  0.0000,  1.0000]], dtype=torch.float16)
+
     def _encode_image(self, image_pil, device, num_images_per_prompt, do_classifier_free_guidance):
         dtype = next(self.image_encoder.parameters()).dtype
 
@@ -155,7 +169,7 @@ class MVDiffusionImagePipeline(DiffusionPipeline):
             # to avoid doing two forward passes
             image_embeddings = torch.cat([negative_prompt_embeds, image_embeddings])
         
-        image_pt = torch.stack([TF.to_tensor(img) for img in image_pil], dim=0).to(device)
+        image_pt = torch.stack([TF.to_tensor(img) for img in image_pil], dim=0).to(device).to(dtype)
         image_pt = image_pt * 2.0 - 1.0
         image_latents = self.vae.encode(image_pt).latent_dist.mode() * self.vae.config.scaling_factor
         # Note: repeat differently from official pipelines
@@ -279,7 +293,24 @@ class MVDiffusionImagePipeline(DiffusionPipeline):
                 camera_embedding
             ], dim=0)
         
-        return camera_embedding    
+        return camera_embedding
+
+    def reshape_to_cd_input(self, input):
+        # reshape input for cross-domain attention
+        input_norm_uc, input_rgb_uc, input_norm_cond, input_rgb_cond = torch.chunk(
+            input, dim=0, chunks=4)
+        input = torch.cat(
+            [input_norm_uc, input_norm_cond, input_rgb_uc, input_rgb_cond], dim=0)
+        return input
+
+    def reshape_to_cfg_output(self, output):
+        # reshape input for cfg
+        output_norm_uc, output_norm_cond, output_rgb_uc, output_rgb_cond = torch.chunk(
+            output, dim=0, chunks=4)
+        output = torch.cat(
+            [output_norm_uc, output_rgb_uc, output_norm_cond, output_rgb_cond],
+            dim=0)
+        return output
 
     @torch.no_grad()
     def __call__(
@@ -288,7 +319,7 @@ class MVDiffusionImagePipeline(DiffusionPipeline):
         # elevation_cond: torch.FloatTensor,
         # elevation: torch.FloatTensor,
         # azimuth: torch.FloatTensor, 
-        camera_embedding: torch.FloatTensor,
+        camera_embedding: Optional[torch.FloatTensor]=None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
@@ -384,10 +415,15 @@ class MVDiffusionImagePipeline(DiffusionPipeline):
         # 2. Define call parameters
         if isinstance(image, list):
             batch_size = len(image)
-        else:
+        elif isinstance(image, torch.Tensor):
             batch_size = image.shape[0]
-        assert batch_size >= self.num_views and batch_size % self.num_views == 0
+            assert batch_size >= self.num_views and batch_size % self.num_views == 0
+        elif isinstance(image, PIL.Image.Image):
+            image = [image]*self.num_views*2
+            batch_size = self.num_views*2
+    
         device = self._execution_device
+        dtype = self.vae.dtype
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
@@ -410,7 +446,12 @@ class MVDiffusionImagePipeline(DiffusionPipeline):
 
         # assert len(elevation_cond) == batch_size and len(elevation) == batch_size and len(azimuth) == batch_size
         # camera_embeddings = self.prepare_camera_condition(elevation_cond, elevation, azimuth, do_classifier_free_guidance=do_classifier_free_guidance, num_images_per_prompt=num_images_per_prompt)
-        assert len(camera_embedding) == batch_size
+        
+        if camera_embedding is not None:
+            assert len(camera_embedding) == batch_size
+        else:
+            camera_embedding = self.camera_embedding.to(dtype)
+            camera_embedding = repeat(camera_embedding, "Nv Nce -> (B Nv) Nce", B=batch_size//len(camera_embedding))
         camera_embeddings = self.prepare_camera_embedding(camera_embedding, do_classifier_free_guidance=do_classifier_free_guidance, num_images_per_prompt=num_images_per_prompt)
 
         # 4. Prepare timesteps
@@ -436,9 +477,15 @@ class MVDiffusionImagePipeline(DiffusionPipeline):
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
+            if do_classifier_free_guidance:
+                image_embeddings = self.reshape_to_cd_input(image_embeddings)
+                camera_embeddings = self.reshape_to_cd_input(camera_embeddings)
+                image_latents = self.reshape_to_cd_input(image_latents)
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                if do_classifier_free_guidance:
+                    latent_model_input = self.reshape_to_cd_input(latent_model_input)
                 latent_model_input = torch.cat([
                     latent_model_input, image_latents
                 ], dim=1)
@@ -449,6 +496,7 @@ class MVDiffusionImagePipeline(DiffusionPipeline):
 
                 # perform guidance
                 if do_classifier_free_guidance:
+                    noise_pred = self.reshape_to_cfg_output(noise_pred)
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
